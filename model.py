@@ -30,16 +30,19 @@ class Head(nn.Module):
 
 
 class PHQ9(nn.Module):
-    def __init__(self, backbone=None, hidden_size=None, task='classification', use_norm=False, dropout_ratio=0.0, hidden_layer_list = [256]):
+    def __init__(self, backbone=None, hidden_size=None, task='classification', use_norm=False, dropout_ratio=0.0, hidden_layer_list = [256], use_mean_pool=False):
 
         task = task.lower()
         assert task in ['classification', 'regression'], "Task must be classification or regression"
-        result_size = {'classification': 28, 'regression': 1}
+        result_size = {'classification': 5, 'regression': 1}
         
         super(PHQ9, self).__init__()
         self.bert = backbone
         self.hidden_size = hidden_size
+        self.task = task    
+        self.use_mean_pool = use_mean_pool
         self.task = task
+
 
         if type(self.bert) == str:
             self.bert = AutoModel.from_pretrained(self.bert)
@@ -48,7 +51,10 @@ class PHQ9(nn.Module):
             self.bert = AutoModel.from_pretrained("mental/mental-bert-base-uncased")
         
         if self.hidden_size is None:
-            self.hidden_size = self.bert.config.hidden_size * 2
+            if use_mean_pool:
+                self.hidden_size = self.bert.config.hidden_size * 2
+            else:
+                self.hidden_size = self.bert.config.hidden_size
 
         self.classifier = Head(self.hidden_size, result_size[task], use_norm=use_norm, dropout_ratio=dropout_ratio, hidden_layer_list=hidden_layer_list)
 
@@ -65,14 +71,37 @@ class PHQ9(nn.Module):
     def forward(self, input_ids, attention_mask=None, labels=None):
         outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         cls_repr = outputs.pooler_output  # [CLS] 토큰 표현
-        mean = outputs.last_hidden_state.mean(dim=1)
-        feat = torch.cat([cls_repr, mean], dim=-1)
-        logits = self.classifier(feat).squeeze(-1)  # shape: (B,)
+        if self.use_mean_pool:
+            mean = outputs.last_hidden_state.mean(dim=1)
+            feat = torch.cat([cls_repr, mean], dim=-1)
+        else:
+            feat = cls_repr
 
+        logits = self.classifier(feat).squeeze(-1)  # shape: (B,)
         if labels is not None:
-            loss = F.mse_loss(logits, labels)
+            if self.task == 'classification':
+                loss = F.cross_entropy(logits, labels)
+            else:
+                loss = F.mse_loss(logits, labels)
             return {"loss": loss, "logits": logits}
         return {"logits": logits}
+    
+    @torch.no_grad()
+    def inference(self, input_ids, attention_mask=None):
+        was_training = self.training
+        self.eval() 
+        out = self.forward(input_ids, attention_mask, labels=None)
+
+        if was_training:
+            self.train()
+        return out['logits']
+    
+    def log(self, input_ids, attention_mask=None, labels=None):
+        outs = self.bert(input_ids=input_ids,
+                         attention_mask=attention_mask)
+        hs = outs.last_hidden_state
+        torch.save(hs, "hs.pt")
+        print(f"HS: {hs}")
     
 
 class PHQ9WithAttnPool(nn.Module):
@@ -332,9 +361,10 @@ class PHQ9DistillationWithAttnPool(nn.Module):
         )
         self.token_attn = nn.Linear(hidden_size, 1)
 
-    def forward(self, input_ids, attention_mask=None, labels=None):
+    def forward(self, input_ids, attention_mask=None, token_type_ids=None, labels=None):
         base_out = self.classifier_model.bert(
             input_ids=input_ids,
+            token_type_ids=token_type_ids,
             attention_mask=attention_mask
         )
         hs = base_out.last_hidden_state

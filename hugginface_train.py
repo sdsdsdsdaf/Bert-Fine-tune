@@ -1,6 +1,6 @@
 from functools import partial
 import numpy as np
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, f1_score, accuracy_score
 from transformers import (
         AutoModelForSequenceClassification, AutoTokenizer, AutoModel,
         Trainer, TrainingArguments, DataCollatorWithPadding
@@ -20,6 +20,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import get_cosine_schedule_with_warmup
 from loss import quantile_loss, combined_top10_loss
+from PHQ9ClassificationDataset import PHQ9ClassificationDataset
+
 
 
 """
@@ -64,24 +66,30 @@ class HuberTrainer(Trainer):
         loss = loss_fct(logits, labels)
 
         return (loss, outputs) if return_outputs else loss
+    
 
 
 import wandb
-model_str = "mental/mental-bert-base-uncased"
-wandb.init(project="PHQ-Feat-Regression", name='Base')
+model_str = "YeRyeongLee/mental-bert-base-uncased-finetuned-0505"
 
 SEED = 42
 epochs = 50
-base_lr = 5e-5
+base_lr = 1e-4
 device = "cuda" if torch.cuda.is_available() else "cpu"
 scheduler = None
 unfreeze_layer_start = 11
 stratrgy = 'epoch'
 step = 1000
 tokenizer = AutoTokenizer.from_pretrained(model_str)
-loss_fn = combined_top10_loss
+task = 'regression'
+loss_fn = nn.MSELoss() if task == 'regression' else nn.CrossEntropyLoss()
+metric = {'classification': 'eval_f1', 'regression': 'eval_rmse'}
+hidden_layer_list = [1024, 1024, 512, 256, 64]
 
-model = PHQ9(backbone=model_str, task='regression', hidden_layer_list=[1024, 512, 256, 128, 64])
+model = PHQ9(backbone=model_str, task=task, hidden_layer_list=hidden_layer_list)
+
+
+# wandb.init(project="PHQ-Feat-Classification", name=f'{12-unfreeze_layer_start}_layer_unfreeze_{len(hidden_layer_list)}_layer_cls_head_Base')
 
 model.to(device)
 print(model)
@@ -101,11 +109,13 @@ for p in model.classifier.parameters():
 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"Number of trainable parameters: {trainable_params:,}")
 
-loss_fn = torch.nn.MSELoss()
 optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=base_lr)
 
 df = pd.read_csv("phq9_dataset.csv")
-full_dataset = PHQ9Dataset("phq9_dataset.csv", model_name=model_str)
+if task == 'classification':
+    full_dataset = PHQ9ClassificationDataset("phq9_dataset.csv", model_name=model_str)
+else:
+    full_dataset = PHQ9Dataset("phq9_dataset.csv", model_name=model_str)
 
 all_indices = list(range(len(full_dataset)))
 all_labels = full_dataset.labels
@@ -124,7 +134,8 @@ test_dataset = Subset(full_dataset, test_idx)
 y_mean = np.array(all_labels)[train_idx].mean()
 y_std  = np.array(all_labels)[train_idx].std()
 
-train_dataset.dataset.labels = (train_dataset.dataset.labels - y_mean) / y_std
+if task=='regression':
+    train_dataset.dataset.labels = (train_dataset.dataset.labels - y_mean) / y_std
 print(f"\n\nTrain_mean: {y_mean}, Train_std: {y_std}")
 
 training_args = TrainingArguments(
@@ -137,13 +148,28 @@ training_args = TrainingArguments(
     eval_strategy=stratrgy,                # 평가 주기 (ex: "steps", "epoch")
     save_strategy=stratrgy,                # 모델 저장 주기
     load_best_model_at_end=True,          # 성능이 가장 좋은 모델 저장
-    metric_for_best_model="eval_rmse",    # 가장 좋은 모델을 판단할 기준 (compute_metrics의 key)
+    metric_for_best_model=metric[task],    # 가장 좋은 모델을 판단할 기준 (compute_metrics의 key)
     logging_dir="./logs",                 # 로그 저장 경로
     max_grad_norm=1.0,                    # 로그 출력 주기 (steps 단위)
     report_to=["wandb"],         
     run_name="phq9-regression",
 )
 
+def compute_metrics_fn_cls(eval_pred):
+    preds, labels = eval_pred
+    preds = np.argmax(preds, axis=-1)
+
+    preds  = np.asarray(preds,  dtype=np.float32)
+    labels = np.asarray(labels, dtype=np.int32)
+
+    f1_score_val = f1_score(labels, preds, average='macro')
+    acc_score_val = accuracy_score(labels, preds)
+    
+    return {"eval_f1": f1_score_val, "eval_acc": acc_score_val}
+
+
+
+    
 
 def compute_metrics_fn(eval_pred, *, y_mean: float, y_std: float):
     preds, labels = eval_pred
@@ -159,7 +185,7 @@ def compute_metrics_fn(eval_pred, *, y_mean: float, y_std: float):
     r2   = r2_score(labels_denorm,  preds_denorm)
     return {"eval_rmse": rmse, "eval_mae": mae, "eval_r2": r2}
 
-compute_metrics = partial(compute_metrics_fn, y_mean=y_mean, y_std=y_std)
+compute_metrics = partial(compute_metrics_fn, y_mean=y_mean, y_std=y_std) if task == 'regression' else compute_metrics_fn_cls
 collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=None)
 
 train_steps = (len(train_dataset) // training_args.per_device_train_batch_size) * training_args.num_train_epochs
@@ -200,7 +226,12 @@ for batch in loader:
     
     with torch.no_grad():
         output = model(input_ids, attn_mask)
-        all_pred.append(output["logits"].cpu())
+        if task == 'regression':
+            preds = output["logits"] * y_std + y_mean
+            labels = labels * y_std + y_mean
+        else:
+            preds = torch.argmax(output["logits"], dim=-1)
+        all_pred.append(preds.cpu())
         all_label.append(labels.cpu())
 
 

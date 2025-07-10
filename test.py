@@ -32,26 +32,20 @@ plt.show()
 import pandas as pd
 import matplotlib.pyplot as plt
 from PHQ9Dataset import PHQ9Dataset
+from datasets import load_dataset
 
+ds = load_dataset("darssanle/GPT-4o-PHQ-9")
+# 2) 구조 한눈에 확인
+print(ds)                    # => DatasetDict(train: X examples)
+print(ds["train"].features)  # => 컬럼 이름과 타입
 
-# 1) 레이블 리스트 추출
-#    Dataset 객체라면 train_dataset["labels"], 
-#    아니면 list-of-dicts라면 아래처럼
-dataset = PHQ9Dataset("phq9_dataset.csv", model_name="mental/mental-bert-base-uncased")
-labels = dataset.labels
+# 3) 첫 번째 샘플 살펴보기
+print(ds["train"][0])        # {'post_title': ..., 'post_text': ..., 'annotations': {...}}
 
-# 2) DataFrame으로 변환
-df = pd.DataFrame(labels, columns=["label"])
+# 4) 여러 개 미리보기
+for row in ds["train"].select(range(3)):
+    print(f"- {row['post_title'][:60]}...")
 
-# 3) 값별 개수 집계
-counts = df["label"].value_counts().sort_index()
-print("Label counts:\n", counts)
-
-# 4) 히스토그램 시각화
-plt.hist(labels, bins=28, range=(-0.5, 27.5))
-plt.xticks(range(0, 28))       # x축 눈금을 0~27로
-plt.xlabel("Label Value")
-plt.ylabel("Frequency")
-plt.title("Label Distribution (by Integer)")
-plt.show()
-
+# 5) pandas DataFrame으로 변환해 테이블 형태로 보기 (작은 파일이므로 부담 없음)
+df = ds["train"].to_pandas()
+print(df.head())
